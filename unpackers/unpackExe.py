@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Advanced PE Resource Extractor
+Advanced PE Resource Extractor with Integrated DLL Renaming
 
 Extracts resources from PE files (executables/DLLs) with flexible filtering options.
-Creates organized output structure with type-based folders and automatic file extension detection.
+Automatically renames extracted DLL files to their OriginalFilename from VersionInfo.
 
 Features:
 - Extract all resources or filter by type/case
+- Automatic DLL renaming using VersionInfo->OriginalFilename
 - Batch processing for multiple PE files
 - Smart file extension detection
 - Duplicate handling with language IDs
@@ -24,6 +25,7 @@ import logging
 from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
 import glob
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -37,11 +39,17 @@ class ResourceExtractor:
     """Handles extraction of resources from PE files."""
     
     def __init__(self, output_dir: str = "extracted_resources", 
-                 uppercase_only: bool = True, custom_extensions: Optional[Dict[str, str]] = None):
+                 uppercase_only: bool = True, custom_extensions: Optional[Dict[str, str]] = None,
+                 auto_rename_dlls: bool = True):
         self.output_dir = Path(output_dir)
         self.uppercase_only = uppercase_only
         self.custom_extensions = custom_extensions or {}
+        self.auto_rename_dlls = auto_rename_dlls
         self.stats = defaultdict(int)
+        self.dll_rename_stats = {'renamed': 0, 'failed': 0, 'skipped': 0}
+        
+        # Characters that are illegal on Windows/Unix filenames
+        self.bad_chars = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
         
         # Default extension mappings
         self.default_extensions = {
@@ -131,6 +139,112 @@ class ResourceExtractor:
         
         return filepath
     
+    def _safe_filename(self, name: str) -> str:
+        """Strip any path, control chars, or invalid filename chars from VersionInfo field."""
+        name = os.path.basename(name)  # remove any supplied path
+        name = self.bad_chars.sub("_", name)  # replace bad chars with underscore
+        return name.strip()
+    
+    def _get_original_filename(self, dll_path: Path) -> Optional[str]:
+        """
+        Return the VersionInfo->OriginalFilename string from dll_path (or None).
+        Handles the fact that pe.FileInfo can be a list of lists.
+        """
+        try:
+            pe = pefile.PE(str(dll_path), fast_load=True)
+            pe.parse_data_directories(
+                directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
+            )
+        except (pefile.PEFormatError, Exception) as e:
+            logger.debug(f"Failed to parse PE file {dll_path}: {e}")
+            return None
+
+        def iter_fileinfo(fi):
+            """Depth-first flatten of nested FileInfo lists."""
+            if isinstance(fi, list):
+                for item in fi:
+                    yield from iter_fileinfo(item)
+            else:
+                yield fi
+
+        try:
+            for fi in iter_fileinfo(getattr(pe, "FileInfo", [])):
+                # We only care about StringFileInfo blocks (they have .StringTable)
+                if not hasattr(fi, "StringTable"):
+                    continue
+
+                for st in fi.StringTable:
+                    for k, v in st.entries.items():
+                        if k.decode(errors="ignore") == "OriginalFilename":
+                            original_name = v.decode(errors="ignore").rstrip("\x00")
+                            pe.close()
+                            return original_name
+        except Exception as e:
+            logger.debug(f"Error reading VersionInfo from {dll_path}: {e}")
+        
+        pe.close()
+        return None
+    
+    def _rename_dll_to_original(self, dll_path: Path) -> bool:
+        """Rename a DLL file to its OriginalFilename from VersionInfo."""
+        original_name = self._get_original_filename(dll_path)
+        
+        if not original_name:
+            logger.debug(f"No OriginalFilename found for {dll_path.name}")
+            self.dll_rename_stats['skipped'] += 1
+            return False
+        
+        # Clean the original filename
+        new_name = self._safe_filename(original_name)
+        base, ext = os.path.splitext(new_name)
+        if not ext:  # OriginalFilename had no extension
+            new_name = base + ".dll"
+        
+        new_path = dll_path.parent / new_name
+        
+        # Check if it's already the correct name
+        if dll_path.resolve() == new_path.resolve():
+            logger.debug(f"{dll_path.name} already matches OriginalFilename")
+            self.dll_rename_stats['skipped'] += 1
+            return False
+        
+        # Handle name conflicts by adding _1, _2, etc.
+        if new_path.exists():
+            stem, ext = os.path.splitext(new_name)
+            counter = 1
+            while True:
+                candidate_name = f"{stem}_{counter}{ext}"
+                candidate_path = dll_path.parent / candidate_name
+                if not candidate_path.exists():
+                    new_path = candidate_path
+                    new_name = candidate_name
+                    break
+                counter += 1
+        
+        try:
+            dll_path.rename(new_path)
+            logger.info(f"  DLL renamed: {dll_path.name} → {new_name}")
+            self.dll_rename_stats['renamed'] += 1
+            return True
+        except Exception as e:
+            logger.error(f"Failed to rename {dll_path.name}: {e}")
+            self.dll_rename_stats['failed'] += 1
+            return False
+    
+    def _rename_dlls_in_directory(self, directory: Path) -> None:
+        """Rename all DLL files in a directory to their OriginalFilename."""
+        if not directory.exists():
+            return
+        
+        dll_files = list(directory.glob("*.dll"))
+        if not dll_files:
+            return
+        
+        logger.info(f"Renaming {len(dll_files)} DLL files in {directory.relative_to(self.output_dir)}...")
+        
+        for dll_file in dll_files:
+            self._rename_dll_to_original(dll_file)
+    
     def extract_from_pe(self, pe_path: Path) -> bool:
         """Extract resources from a single PE file."""
         try:
@@ -149,6 +263,7 @@ class ResourceExtractor:
                 return False
             
             resources_found = 0
+            dllblock_dir = None
             
             # Process each resource type
             for type_entry in pe.DIRECTORY_ENTRY_RESOURCE.entries:
@@ -167,6 +282,10 @@ class ResourceExtractor:
                 # Create output directory for this type
                 type_output_dir = self.output_dir / pe_path.stem / type_name
                 type_output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Remember DLLBLOCK directory for later renaming
+                if type_name == "DLLBLOCK":
+                    dllblock_dir = type_output_dir
                 
                 logger.info(f"Extracting {type_name} resources...")
                 
@@ -204,6 +323,10 @@ class ResourceExtractor:
                             logger.error(f"Error extracting resource {res_name}: {e}")
             
             pe.close()
+            
+            # Auto-rename DLLs if enabled and DLLBLOCK was extracted
+            if self.auto_rename_dlls and dllblock_dir:
+                self._rename_dlls_in_directory(dllblock_dir)
             
             if resources_found > 0:
                 logger.info(f"Successfully extracted {resources_found} resources from {pe_path}")
@@ -248,6 +371,13 @@ class ResourceExtractor:
                 if res_type not in ('total_files', 'total_bytes'):
                     print(f"  {res_type}: {count:,}")
         
+        # Print DLL renaming summary if auto-rename was enabled
+        if self.auto_rename_dlls and any(self.dll_rename_stats.values()):
+            print("\nDLL Renaming Summary:")
+            print(f"  Renamed: {self.dll_rename_stats['renamed']}")
+            print(f"  Skipped: {self.dll_rename_stats['skipped']}")
+            print(f"  Failed: {self.dll_rename_stats['failed']}")
+        
         print("="*60)
 
 def find_pe_files(search_path: Path, recursive: bool = False) -> List[Path]:
@@ -272,27 +402,30 @@ def find_pe_files(search_path: Path, recursive: bool = False) -> List[Path]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract resources from PE files (EXE/DLL) with advanced filtering",
+        description="Extract resources from PE files (EXE/DLL) with automatic DLL renaming",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract from single file (uppercase types only)
-  python resource_extractor.py game.exe
+  # Extract from single file (uppercase types only, auto-rename DLLs)
+  python unpackExe.py game.exe
   
   # Extract all resource types (including mixed-case)
-  python resource_extractor.py game.exe --all-types
+  python unpackExe.py game.exe --all-types
+  
+  # Extract without auto-renaming DLLs
+  python unpackExe.py game.exe --no-rename-dlls
   
   # Extract to specific output directory
-  python resource_extractor.py game.exe -o extracted_resources
+  python unpackExe.py game.exe -o extracted_resources
   
   # Batch process all PE files in a directory
-  python resource_extractor.py -b /path/to/games --recursive
+  python unpackExe.py -b /path/to/games --recursive
   
   # Extract only specific resource types
-  python resource_extractor.py game.exe --types IMAGEBLOCK DLLBLOCK FILES
+  python unpackExe.py game.exe --types IMAGEBLOCK DLLBLOCK FILES
   
   # Add custom file extensions
-  python resource_extractor.py game.exe --ext CUSTOMTYPE:.dat MYRES:.bin
+  python unpackExe.py game.exe --ext CUSTOMTYPE:.dat MYRES:.bin
         """
     )
     
@@ -332,6 +465,13 @@ Examples:
         '--types',
         nargs='+',
         help='Extract only specified resource types'
+    )
+    
+    # DLL renaming options
+    parser.add_argument(
+        '--no-rename-dlls',
+        action='store_true',
+        help='Disable automatic DLL renaming to OriginalFilename'
     )
     
     # Extension customization
@@ -385,7 +525,8 @@ Examples:
         extractor = ResourceExtractor(
             output_dir=args.output,
             uppercase_only=not args.all_types,
-            custom_extensions=custom_extensions
+            custom_extensions=custom_extensions,
+            auto_rename_dlls=not args.no_rename_dlls
         )
         
         if args.batch:
