@@ -87,10 +87,14 @@ imageblock_extracted/
 ### ImHex Pattern
 For manual binary analysis in ImHex hex editor.
 
+Supports:
+- `ImageBlock`
+- `LevelBlock`
+
 **Usage:**
-1. Open imageblock file in ImHex
+1. Open block file in ImHex (imageblock/id_998.bin)
 2. Load pattern: `File → Import → Pattern File`
-3. Select `patterns/ImageBlock.hexpat`
+3. Select your pattern (`patterns/ImageBlock.hexpat`)
 4. Analyze binary structure visually
 
 ## Typical Workflow
